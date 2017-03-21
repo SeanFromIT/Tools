@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  AWS CloudFormation Template Continuous Delievery: This template
+  builds an AWS CodePipeline pipeline that implements a continuous delivery release
+  process for AWS CloudFormation stacks. Submit a CloudFormation source artifact
+  to git before building the pipeline. The pipeline uses the
+  artifact to automatically create change sets and stacks.
+
+Parameters:
+  PipelineName:
+    Description: A name for pipeline
+    Type: String
+  CodeCommitRepo:
+    Description: The name of the CodeCommit Repo that contains the source artifact
+    Type: String
+  CodeCommitBranch:
+    Description: The name of the git branch that contains the source artifact
+    Type: String
+  TemplateFileName:
+    Description: The file name of the CFN template
+    Type: String
+  NPStackName:
+    Default: NP-CFNCP
+    Description: A name for the Non-Prod CFN stack
+    Type: String
+  NPStackConfig:
+    Description: The parameters json file name, if any, for non-prod
+    Type: String
+  ProdStackName:
+    Default: Prod-CFNCP
+    Description: A name for the production CFN stack
+    Type: String
+  ProdStackConfig:
+    Description: The parameters json file name, if any, for prod
+    Type: String
+  ChangeSetName:
+    Default: UpdatePreview-CFNCP
+    Description: A name for the stack change set
+    Type: String
+  Email:
+    Description: The email address where CodePipeline sends pipeline notifications
+    Type: String
+  ProdAccount:
+    AllowedPattern: ^[0-9]{12}$
+    ConstraintDescription: Must be a valid AWS account ID
+    Description: Please specify the prod account number, e.g. 123456789012.
+    Type: String
+  ProdAccountActionRoleARN:
+    Description: ARN of CloudFormationCrossAccountDeployment Role in Prod acct
+    Type: String
+  ProdAccountCFNServiceRole:
+    Description: ARN of CloudFormationServiceRole in Prod acct
+    Type: String
+
+Conditions:
+  NPJSONProvided: !Not [!Equals ['', !Ref 'NPStackConfig']]
+  ProdJSONProvided: !Not [!Equals ['', !Ref 'ProdStackConfig']]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Account Settings
+        Parameters:
+          - ProdAccount
+          - ProdAccountActionRoleARN
+          - ProdAccountCFNServiceRole
+      - Label:
+          default: CodePipeline Settings
+        Parameters:
+          - PipelineName
+          - CodeCommitRepo
+          - CodeCommitBranch
+          - TemplateFileName
+          - Email
+      - Label:
+          default: Non-Prod Stack Settings
+        Parameters:
+          - NPStackName
+          - NPStackConfig
+      - Label:
+          default: Production Stack Settings
+        Parameters:
+          - ProdStackName
+          - ProdStackConfig
+
+Resources:
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  ArtifactStoreBucketPolicy:
+    DependsOn: ArtifactStoreBucket
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket:
+        !Ref ArtifactStoreBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        -
+          Sid: AllowProdAccess1
+          Action:
+            - s3:Get*
+            - s3:Put*
+          Effect: Allow
+          Resource: !Join ["",["arn:aws:s3:::",!Ref 'ArtifactStoreBucket',"/*"]]
+          Principal:
+            AWS: !Join ["",["arn:aws:iam::",!Ref 'ProdAccount',":root"]]
+        -
+          Sid: AllowProdAccess2
+          Action:
+            - s3:ListBucket
+          Effect: Allow
+          Resource: !Join ["",["arn:aws:s3:::",!Ref 'ArtifactStoreBucket']]
+          Principal:
+            AWS: !Join ["",["arn:aws:iam::",!Ref 'ProdAccount',":root"]]
+        -
+          Sid: DenyUnencryptedObjectUploads
+          Action:
+            s3:PutObject
+          Effect: Deny
+          Resource: !Join ["",["arn:aws:s3:::",!Ref 'ArtifactStoreBucket',"/*"]]
+          Principal: '*'
+          Condition:
+            StringNotEquals:
+              s3:x-amz-server-side-encryption: "aws:kms"
+        -
+          Sid: DenyInsecureConnections
+          Action:
+            - s3:*
+          Effect: Deny
+          Resource: !Join ["",["arn:aws:s3:::",!Ref 'ArtifactStoreBucket',"/*"]]
+          Principal: '*'
+          Condition:
+            Bool:
+              aws:SecureTransport: false
+
+  CodePipelineSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref 'ArtifactStoreBucket'
+        Type: S3
+        EncryptionKey:
+          Id: !ImportValue CPKMSKeyARN
+          Type: KMS
+      DisableInboundStageTransitions: []
+      Name: !Ref 'PipelineName'
+      RoleArn: !GetAtt [PipelineRole, Arn]
+      Stages:
+        - Name: CodeCommitSource
+          Actions:
+            - Name: TemplateSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref 'CodeCommitRepo'
+                BranchName: !Ref 'CodeCommitBranch'
+              OutputArtifacts: [Name: TemplateSource]
+              RunOrder: '1'
+
+        - Name: NPStage
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref NPStackName
+                ChangeSetName: !Ref ChangeSetName
+                TemplateConfiguration: !If [NPJSONProvided, !Sub "TemplateSource::${NPStackConfig}", !Ref 'AWS::NoValue']
+                TemplatePath: !Sub "TemplateSource::${TemplateFileName}"
+              RunOrder: '1'
+            - Name: ApproveTestStack
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref CodePipelineSNSTopic
+                CustomData: !Sub 'Do you want to create a change set against the non-prod stack?'
+              RunOrder: '2'
+            - Name: ExecuteTestChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: !Ref ChangeSetName
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref NPStackName
+              RunOrder: '3'
+            - Name: ApproveMoveToProd
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref CodePipelineSNSTopic
+                CustomData: !Sub 'Do you want to create this same change set against the production stack?'
+              RunOrder: '4'
+
+        - Name: ProdStage
+          Actions:
+            - Name: CreateChangeSet
+              RoleArn: !Ref ProdAccountActionRoleARN
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !Ref ProdAccountCFNServiceRole
+                StackName: !Ref ProdStackName
+                ChangeSetName: !Ref ChangeSetName
+                TemplateConfiguration: !If [ProdJSONProvided, !Sub "TemplateSource::${ProdStackConfig}", !Ref 'AWS::NoValue']
+                TemplatePath: !Sub "TemplateSource::${TemplateFileName}"
+              RunOrder: '1'
+            - Name: ApproveChangeSet
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref CodePipelineSNSTopic
+                CustomData: !Sub 'A new change set was created for the ${ProdStackName} stack. Do you want to implement the changes?'
+              RunOrder: '2'
+            - Name: ExecuteChangeSet
+              RoleArn: !Ref ProdAccountActionRoleARN
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: !Ref ChangeSetName
+                RoleArn: !Ref ProdAccountCFNServiceRole
+                StackName: !Ref ProdStackName
+              RunOrder: '3'
+
+  CFNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [cloudformation.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CloudFormationRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'ec2:*'
+                Effect: Allow
+                Resource: '*'
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [codepipeline.amazonaws.com]
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            AWS: !Join ['', ['arn:aws:iam::', !Ref 'ProdAccount', ':root']]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 's3:*'
+                - 'codecommit:*'
+                - 'cloudformation:*'
+                - 'iam:PassRole'
+                - 'sns:Publish'
+                Effect: Allow
+                Resource: '*'
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - "kms:Encrypt"
+                - "kms:Decrypt"
+                - "kms:ReEncrypt*"
+                - "kms:GenerateDataKey*"
+                - "kms:DescribeKey"
+                Effect: Allow
+                Resource: '*'
+        - PolicyName: ProdAccountAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              Action:
+                - 'sts:AssumeRole'
+              Effect: Allow
+              Resource: !Join ['', ['arn:aws:iam::', !Ref 'ProdAccount', ':role/*']]

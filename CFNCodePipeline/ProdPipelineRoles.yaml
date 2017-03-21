@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates the necessary roles for cross-account Code Pipeline activities reaching into this account.
+
+Parameters:
+  CodePipelineAccount:
+    AllowedPattern: ^[0-9]{12}$
+    ConstraintDescription: Must be a valid AWS account ID
+    Description: Please specify the account ID of the AWS account hosting the Code Pipeline, e.g. 123456789012.
+    Type: String
+  KMSKeyARN:
+    Description: ARN of the KMS Key used by CodePipeline
+    Type: String
+
+Resources:
+  CloudFormationCrossAccountDeployment:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [cloudformation.amazonaws.com]
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            AWS: !Join ['', ['arn:aws:iam::', !Ref 'CodePipelineAccount', ':root']]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CloudFormationCrossAccountDeployment
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 'cloudformation:*'
+                - 'iam:PassRole'
+                - 's3:*'
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                - "kms:Encrypt"
+                - "kms:Decrypt"
+                - "kms:ReEncrypt*"
+                - "kms:GenerateDataKey*"
+                - "kms:DescribeKey"
+                Effect: Allow
+                Resource: !Ref KMSKeyARN
+
+  CloudFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [cloudformation.amazonaws.com]
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            AWS: !Join ['', ['arn:aws:iam::', !Ref 'CodePipelineAccount', ':root']]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CloudFormationServiceRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'ec2:*'
+                Effect: Allow
+                Resource: '*'
+
+Outputs:
+  CloudFormationCrossAccountDeployment:
+    Description: CP Action Role
+    Value: !GetAtt [CloudFormationCrossAccountDeployment, Arn]
+  CloudFormationServiceRole:
+    Description: CP Service Role
+    Value: !GetAtt [CloudFormationServiceRole, Arn]

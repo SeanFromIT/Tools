@@ -1,0 +1,63 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates the KMS key for CodePipeline.
+
+Parameters:
+  ProdAccount:
+    AllowedPattern: ^[0-9]{12}$
+    ConstraintDescription: Must be a valid AWS account ID
+    Description: Please specify the prod account number, e.g. 123456789012.
+    Type: String
+  KMSAdmin:
+    AllowedPattern: ^\w+\/\w+$
+    ConstraintDescription: Input in format user/Name, group/Name, or role/Name.
+    Description: IAM User, Group or Role to have admin access to the KMS key. Input in format user/Name, group/Name, or role/Name.
+    Type: String
+
+Resources:
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CodePipeline KMS Key
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: "key-default-1"
+        Statement:
+          -
+            Sid: "Allow administration of the key"
+            Effect: "Allow"
+            Principal:
+              AWS: !Join ["", ["arn:aws:iam::",!Ref "AWS::AccountId",":",!Ref "KMSAdmin"]]
+            Action:
+              - "kms:*"
+            Resource: "*"
+          -
+            Sid: "Allow use of the key by this account"
+            Effect: "Allow"
+            Principal:
+              AWS: !Join ["", ["arn:aws:iam::",!Ref "AWS::AccountId",":root"]]
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+          -
+            Sid: "Allow use of the key by prod account"
+            Effect: "Allow"
+            Principal:
+              AWS: !Join ["", ["arn:aws:iam::",!Ref "ProdAccount",":root"]]
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+
+Outputs:
+  CPKMSKeyARN:
+    Description: KMS Key ARN for CodePipeline
+    Value: !GetAtt [KMSKey, Arn]
+    Export:
+      Name: CPKMSKeyARN
