@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates a RESTful service
+Parameters:
+  LambdaIAMRole:
+    Description: IAM Role with permissions to any other AWS services your lambda calls
+    Type: String
+    AllowedPattern: 'arn:aws:[-a-zA-Z0-9:\/._+]*'
+    ConstraintDescription: Must be an AWS ARN of format arn:aws:iam::############:role/name
+  Bucket:
+    Description: S3 bucket where your lambda code resides
+    Type: String
+  Zip:
+    Description: S3 key of your lambda code zip. e.g. code.zip or prefix/code.zip.
+    Type: String
+    AllowedPattern: '.+\.zip'
+  LambdaDescription:
+    Description: Description of your lambda
+    Type: String
+  HandlerFunction:
+    Description: Your handler function. If it's defined as handler() in index.py, it would be index.handler for example.
+    Type: String
+    Default: index.handler
+  LambdaLanguage:
+    Description: Language of your lambda code.
+    Type: String
+    AllowedValues:
+      - python3.6
+      - python2.7
+      - nodejs
+      - nodejs4.3
+      - nodejs6.10
+      - nodejs8.10
+      - go1.x
+      - dotnetcore2.0
+      - dotnetcore1.0
+      - java8
+  APIGatewayName:
+    Description: Name of your service
+    Type: String
+  APIGatewayDescription:
+    Description: Description of your service
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: Lambda
+        Parameters:
+          - LambdaDescription
+          - LambdaLanguage
+          - HandlerFunction
+          - Bucket
+          - Zip
+          - LambdaIAMRole
+      -
+        Label:
+          default: API Gateway Service
+        Parameters:
+          - APIGatewayName
+          - APIGatewayDescription
+
+Resources:
+#Build multi-AZ lambdas
+  LambdaExplicit:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref Bucket
+        S3Key: !Ref Zip
+      Description: !Ref LambdaDescription
+      Handler: !Ref HandlerFunction
+      Role: !Ref LambdaIAMRole
+      Runtime: !Ref LambdaLanguage
+
+#Build multi-AZ API Gateway Resources
+  #Logging
+  ApiGatewayCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        -
+          PolicyName: ApiGatewayLogsPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: '*'
+
+  apiGatewayLoggingRole:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt [ApiGatewayCloudWatchLogsRole, Arn]
+
+  #Gateway
+  apiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref APIGatewayName
+      Description: !Ref APIGatewayDescription
+      FailOnWarnings: true
+
+  apiGatewayPermissions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt [LambdaExplicit, Arn]
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join
+        - ''
+        - - "arn:aws:execute-api:"
+          - !Ref AWS::Region
+          - ":"
+          - !Ref AWS::AccountId
+          - ":"
+          - !Ref apiGateway
+          - "/*"
+
+  #URL Methods
+  productsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref apiGateway
+      ParentId: !GetAtt [apiGateway, RootResourceId]
+      PathPart: products
+
+  productsIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref apiGateway
+      ParentId: !Ref productsResource
+      PathPart: "{id}"
+
+  ApiGatewayGETMethod:
+    DependsOn: apiGatewayPermissions
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref productsIdResource
+      RestApiId: !Ref apiGateway
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Join
+          - ""
+          - - "arn:aws:apigateway:"
+            - !Ref AWS::Region
+            - ":lambda:path/2015-03-31/functions/"
+            - !GetAtt [LambdaExplicit, Arn]
+            - "/invocations"
+        RequestTemplates:
+          application/json: !Join
+            - ""
+            - - "{"
+              - "\"id\": \"$input.params('id')\""
+              - ", "
+              - "\"httpMethod\": \"$context.httpMethod\""
+              - "}"
+        RequestParameters:
+          integration.request.path.id: method.request.path.id
+        IntegrationResponses:
+          - StatusCode: 200
+          - StatusCode: 400
+      RequestParameters:
+        method.request.path.id: true
+      RequestValidatorId: !Ref RequestValidator
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 400
+
+  #Input Validation
+  #Ensures request parameters in the URI of the incoming
+  # request are included and non-blank. If not, returns
+  # a 400 error response to the caller, and publishes
+  # the validation results in CloudWatch Logs.
+  RequestValidator:
+    Type: 'AWS::ApiGateway::RequestValidator'
+    Properties:
+      Name: "{id} validator"
+      RestApiId: !Ref apiGateway
+      ValidateRequestParameters: true
+
+  #Deployment
+  ApiDeployment:
+    DependsOn: ApiGatewayGETMethod
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref apiGateway
+      #A stage to stick around, while LATEST changes:
+      StageName: BaseStage
+
+  latestStage:
+    DependsOn: apiGatewayLoggingRole
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      MethodSettings:
+        -
+          DataTraceEnabled: true
+          HttpMethod: "*"
+          LoggingLevel: "INFO"
+          ResourcePath: "/*"
+      RestApiId: !Ref apiGateway
+      StageName: "LATEST"
+
+Outputs:
+  RootURL:
+    Description: URL of the API gateway
+    Value: !Join
+      - ""
+      - - "https://"
+        - !Ref apiGateway
+        - ".execute-api."
+        - !Ref AWS::Region
+        - ".amazonaws.com/LATEST/products/"
