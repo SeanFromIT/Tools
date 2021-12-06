@@ -12,7 +12,8 @@ regions = [ "us-east-1", "us-east-2" ]
 boto3.setup_default_session(profile_name='myRole')
 
 # 3600 seconds in an hour, this value should match your role's
-# maximum session duration (AWS default is 1 hour).
+# maximum session duration (AWS default is 1 hour). If you're
+# role chaining (e.g. saml2aws) 1 hour is a hard limit.
 def refresh_external_credentials():
     # Assume role, get details
     client = boto3.client('sts')
